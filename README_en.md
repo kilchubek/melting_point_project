@@ -133,7 +133,7 @@ melting_point_project/
   README.md
 ```
 
-Run order: `01_clean_data` → `02_features` → the modeling notebooks `03_models_split`, `03_models_scaffold` and `03_models_Kfold`.
+Run order: `01_clean_data` → `02_features` → the modeling notebooks `03_models_split`, `03_models_scaffold`, `03_models_Kfold` and `03_models_fe`.
 
 ## Environment
 
