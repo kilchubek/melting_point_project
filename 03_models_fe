@@ -1,0 +1,110 @@
+from google.colab import drive
+drive.mount("/content/drive")
+
+BASE = "/content/drive/MyDrive/melting_point_project"   # поправьте под своё название папки
+RAW = f"{BASE}/data/raw"
+PROC = f"{BASE}/data/processed"
+
+import pandas as pd
+import numpy as np
+
+X = pd.read_parquet(f"{PROC}/descriptors.parquet")      # или pd.read_csv(...)
+meta = pd.read_csv(f"{PROC}/melting_points_clean.csv")
+y = meta["mpC"].values
+print(X.shape, len(y))
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.model_selection import GroupKFold, cross_validate
+from sklearn.dummy import DummyRegressor
+
+!pip install rdkit
+
+from rdkit import Chem
+from rdkit.Chem.Scaffolds import MurckoScaffold
+from sklearn.model_selection import GroupShuffleSplit
+
+scaf = meta['smiles_can'].apply(lambda s: MurckoScaffold.MurckoScaffoldSmiles(smiles=s))
+groups = [sc if sc else s for sc, s in zip(scaf, meta['smiles_can'])]
+splits = list(GroupKFold(n_splits=5).split(X, y, groups))
+print("размеры тестовых частей:", [len(te) for tr, te in splits])
+models = {
+    "median": DummyRegressor(strategy="median"),
+    "rf": make_pipeline(SimpleImputer(strategy="median"),
+                        RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=0)),
+}
+scoring = {"MAE": "neg_mean_absolute_error", "RMSE": "neg_root_mean_squared_error"}
+rows = []
+for name, model in models.items():
+    r = cross_validate(model, X, y, cv=splits, scoring=scoring)
+    rows.append({
+        "model": name,
+        "MAE": -r["test_MAE"].mean(),   "MAE_std": r["test_MAE"].std(),
+        "RMSE": -r["test_RMSE"].mean(), "RMSE_std": r["test_RMSE"].std(),
+    })
+    print(name, "RMSE по фолдам:", np.round(-r["test_RMSE"], 1))
+
+print(pd.DataFrame(rows).round(1))
+from sklearn.feature_selection import SelectFromModel
+
+K = 11
+
+rf_top = make_pipeline(
+    SimpleImputer(strategy="median"),
+    SelectFromModel(RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=0, max_features=0.3), 
+    max_features=K, threshold=-np.inf),
+    RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=0),
+)
+for K in [5, 11, 25, 50, 100]:
+    pipe = make_pipeline(
+        SimpleImputer(strategy="median"),
+        SelectFromModel(RandomForestRegressor(n_estimators=50, max_features=0.3, n_jobs=-1, random_state=0),
+                        max_features=K, threshold=-np.inf),
+        RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=0))
+    r = cross_validate(pipe, X, y, cv=splits, scoring=scoring)
+    print(K, f"RMSE {-r['test_RMSE'].mean():.1f} ± {r['test_RMSE'].std():.1f}")
+claude_cols = ["MolWt", "HeavyAtomCount", "NumHDonors", "NumHAcceptors", "TPSA",
+             "MolLogP", "NumRotatableBonds", "FractionCSP3",
+             "NumAromaticRings", "RingCount"]
+mine_cols = ["MolWt","TPSA","NumHAcceptors", 'MolLogP', 
+             'HeavyAtomCount', 'LabuteASA', 'NumRotatableBonds', 'FractionCSP3',
+             'NumAromaticRings', 'RingCount']
+configs = {
+    "all desc":  (models["rf"], X),
+    "top-K model":  (rf_top,       X),
+    "mine":        (models["rf"], X[mine_cols]),
+    "claude":      (models["rf"], X[claude_cols]),
+}
+
+rows = []
+for name, (m, Xs) in configs.items():
+    r = cross_validate(m, Xs, y, cv=splits, scoring=scoring)
+    rows.append({"set": name,
+                 "MAE": -r["test_MAE"].mean(),
+                 "RMSE": -r["test_RMSE"].mean(), "RMSE_std": r["test_RMSE"].std()
+                 })
+print(pd.DataFrame(rows).round(1))
+X2 = X.copy()
+X2["HBD_per_atom"]       = X["NumHDonors"] / X["HeavyAtomCount"].clip(lower=1)
+X2["TPSA_per_mass"]      = X["TPSA"] / X["MolWt"]
+X2["rot_per_atom"]       = X["NumRotatableBonds"] / X["HeavyAtomCount"].clip(lower=1)
+X2["force_over_freedom"] = (X["NumHDonors"] + X["NumHAcceptors"] + X["TPSA"]/20) / (1 + X["NumRotatableBonds"])
+
+new_feats = ["HBD_per_atom", "TPSA_per_mass", "rot_per_atom", "force_over_freedom"]
+print("X:", X.shape, "| X2:", X2.shape, "| mine_cols:", len(mine_cols))
+print("нет в X2:", [c for c in mine_cols + new_feats if c not in X2.columns])
+
+# 2. сравнение четырёх наборов
+sets = {
+    "базовый физ.":    mine_cols,
+    "физ. + 4 новых":  mine_cols + new_feats,
+    "все дескрипторы": list(X.columns),
+    "все + 4 новых":   list(X.columns) + new_feats,
+}
+
+for name, cols in sets.items():
+    r = cross_validate(models["rf"], X2[cols], y, cv=splits, scoring=scoring)
+    print(f"{name:16s} {len(cols):3d} признаков | RMSE {-r['test_RMSE'].mean():.1f} ± {r['test_RMSE'].std():.1f}")
